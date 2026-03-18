@@ -8,6 +8,7 @@ Binance, OKX, Bybit 3개 거래소의 `현물(spot)`과 `무기한 퍼페추얼(
 - 코인별 `최저 spot`, `최고 perp`, `premium %`
 - 전체 코인 중 `가장 큰 gap` 조합
 - 거래소별 스트림 연결 상태와 최신 데이터 지연값(ms)
+- `0.5% 이상 gap` 발생 기록과 유지시간(record tab)
 
 ## 계산 기준
 
@@ -23,6 +24,10 @@ Binance, OKX, Bybit 3개 거래소의 `현물(spot)`과 `무기한 퍼페추얼(
   - 각 코인별로 세 거래소 중 `가장 낮은 spot mid`
   - 세 거래소 중 `가장 높은 perp mid`
   - `premium(%) = (최고 perp - 최저 spot) / 최저 spot * 100`
+- 기록 저장:
+  - `premium >= 0.5%`가 되면 gap event를 SQLite DB에 저장
+  - 저장 항목: `코인`, `spot 거래소`, `spot 가격`, `perp 거래소`, `perp 가격`, `gap`, `발생시간`, `유지시간`
+  - gap이 유지되는 동안 duration을 계속 갱신하고, 조건이 깨지면 record를 종료
 
 ## 화면 구성
 
@@ -39,11 +44,15 @@ Binance, OKX, Bybit 3개 거래소의 `현물(spot)`과 `무기한 퍼페추얼(
 - `Realtime Table`
   - 코인별 거래소별 `spot / perp` 미드
   - 코인별 `최저 spot`, `최고 perp`, `premium`
+- `Record`
+  - 0.5% 이상 gap 이벤트 저장 목록
+  - 활성 상태 여부, 유지시간, 발생시간 확인
 
 ## 기술 스택
 
 - Frontend: `Vite`, `TypeScript`
 - Backend: `Node.js`, `Express`, `ws`, `TypeScript`
+- Storage: `SQLite (node:sqlite)`
 - Streaming:
   - 거래소 웹소켓 수집
   - 브라우저에는 `SSE(Server-Sent Events)`로 스냅샷 전달
@@ -55,6 +64,7 @@ Binance, OKX, Bybit 3개 거래소의 `현물(spot)`과 `무기한 퍼페추얼(
 ├─ server/
 │  ├─ src/
 │  │  ├─ exchanges.ts   # 거래소 메타데이터/심볼 선택/상위 코인 선정
+│  │  ├─ records.ts     # gap record SQLite 저장/조회
 │  │  ├─ service.ts     # 웹소켓 연결, 미드 계산, 스냅샷 집계
 │  │  ├─ index.ts       # Express API + SSE + 정적 파일 서빙
 │  │  └─ types.ts       # 공통 타입
@@ -128,6 +138,11 @@ npm start
 브라우저 대시보드가 구독하는 `SSE` 스트림입니다.
 현재는 1초마다 전체 스냅샷을 전송합니다.
 
+### `GET /api/records`
+
+저장된 gap record 목록을 반환합니다.
+대시보드는 현재 `/api/snapshot`의 `records` 필드도 함께 사용합니다.
+
 ## 데이터 흐름
 
 1. 서버가 각 거래소 REST API로 상장 심볼과 24시간 거래량을 조회합니다.
@@ -136,7 +151,8 @@ npm start
 4. 선택된 코인만 각 거래소 웹소켓에 구독합니다.
 5. 서버가 최우선 호가를 받아 `mid` 가격을 계산합니다.
 6. 코인별 `최저 spot / 최고 perp / premium`을 계산합니다.
-7. 브라우저는 `/api/stream`을 통해 1초마다 최신 스냅샷을 반영합니다.
+7. `premium >= 0.5%`이면 SQLite DB에 gap event를 기록하고 duration을 갱신합니다.
+8. 브라우저는 `/api/stream`을 통해 1초마다 최신 스냅샷을 반영합니다.
 
 ## 현재 구현 메모
 
@@ -144,38 +160,11 @@ npm start
 - 단, 어떤 코인이 상위 10개에 들어오는지는 거래량에 따라 바뀔 수 있습니다.
 - 대상 코인 목록은 서버에서 `30분마다` 다시 계산합니다.
 - 가격 freshness 판정 기준은 현재 `15초`입니다.
+- gap record DB 파일은 `data/gap-records.sqlite`에 생성됩니다.
 - 거래소 응답 구조 차이 때문에 각 거래소별 심볼/오더북 파싱 로직이 분리되어 있습니다.
-
-## 개발 중 볼 수 있는 로그
-
-개발 서버 시작 직후 아래 로그가 1회 보일 수 있습니다.
-
-```text
-[vite] http proxy error: /api/stream
-AggregateError [ECONNREFUSED]
-```
-
-이 경우는 대부분 `Vite 클라이언트가 먼저 뜨고`, `8787 백엔드 서버가 아직 준비되기 전`에 `/api/stream` 연결을 시도해서 생기는 초기 연결 실패입니다.
-
-정상적인 경우라면:
-
-- 잠깐 1회 출력된 뒤
-- 백엔드가 올라오고
-- 프론트가 자동 재연결합니다
-
-계속 반복되면 백엔드가 죽었거나 `/api/stream`이 정상적으로 열리지 않은 상태입니다.
 
 ## 공식 문서
 
 - Binance: https://developers.binance.com/docs
 - OKX: https://www.okx.com/docs-v5/en/
 - Bybit: https://bybit-exchange.github.io/docs/v5/intro
-
-## 개선 아이디어
-
-- 대상 코인 수를 설정값으로 분리
-- 거래소별/코인별 필터 UI 추가
-- premium 임계치 알림
-- 음수/양수 premium 강조 스타일 개선
-- 최근 n초 기준 mini trend 표시
-- 배포용 Dockerfile 및 환경설정 추가

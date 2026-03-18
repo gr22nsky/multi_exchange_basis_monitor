@@ -1,5 +1,6 @@
 import WebSocket from 'ws';
 import { buildMarketLookup, getBinanceStreamPath, loadSelections } from './exchanges.js';
+import { GAP_RECORD_THRESHOLD_PCT, GapRecordStore } from './records.js';
 import {
   EXCHANGES,
   type CoinSnapshot,
@@ -12,6 +13,11 @@ import {
 } from './types.js';
 
 type ExchangeQuoteStore = Record<Exchange, { spot: Quote | null; perp: Quote | null }>;
+interface ActiveGapRecordState {
+  id: number;
+  routeKey: string;
+  startedAt: number;
+}
 
 const STALE_AFTER_MS = 15_000;
 const RECONNECT_DELAY_MS = 5_000;
@@ -43,11 +49,15 @@ function closeSocket(socket?: WebSocket): void {
 
 export class MarketMonitorService {
   private selection: MarketSelection[] = [];
+  private selectionIndex = new Map<string, MarketSelection>();
   private quotes = new Map<string, ExchangeQuoteStore>();
   private streamHealth = createHealthMap();
+  private readonly recordStore = new GapRecordStore();
+  private activeGapRecords = new Map<string, ActiveGapRecordState>();
   private sockets: Partial<Record<`${Exchange}:${MarketKind}`, WebSocket>> = {};
   private pingTimers: NodeJS.Timeout[] = [];
   private refreshTimer?: NodeJS.Timeout;
+  private sweepTimer?: NodeJS.Timeout;
 
   async start(): Promise<void> {
     await this.reloadSelection();
@@ -55,6 +65,11 @@ export class MarketMonitorService {
       void this.reloadSelection();
     }, 30 * 60 * 1000);
     this.refreshTimer.unref();
+
+    this.sweepTimer = setInterval(() => {
+      this.syncGapRecords();
+    }, 1000);
+    this.sweepTimer.unref();
   }
 
   stop(): void {
@@ -69,6 +84,13 @@ export class MarketMonitorService {
     if (this.refreshTimer) {
       clearInterval(this.refreshTimer);
     }
+
+    if (this.sweepTimer) {
+      clearInterval(this.sweepTimer);
+    }
+
+    this.closeAllActiveGapRecords(Date.now());
+    this.recordStore.close();
   }
 
   getSnapshot(): DashboardSnapshot {
@@ -82,6 +104,7 @@ export class MarketMonitorService {
     return {
       coins,
       leader,
+      records: this.recordStore.listRecords(100),
       updatedAt: Date.now(),
       staleAfterMs: STALE_AFTER_MS,
       streamHealth: this.streamHealth,
@@ -113,8 +136,21 @@ export class MarketMonitorService {
 
   private async reloadSelection(): Promise<void> {
     const nextSelection = await loadSelections(10);
+    const nextSelectionIndex = new Map(nextSelection.map((item) => [item.base, item]));
+    const now = Date.now();
+
+    for (const [base, active] of this.activeGapRecords) {
+      if (!nextSelectionIndex.has(base)) {
+        this.recordStore.closeRecord(active.id, now, now - active.startedAt);
+        this.activeGapRecords.delete(base);
+      }
+    }
+
     this.selection = nextSelection;
-    this.quotes = new Map(nextSelection.map((item) => [item.base, emptyExchangeQuoteStore()]));
+    this.selectionIndex = nextSelectionIndex;
+    this.quotes = new Map(
+      nextSelection.map((item) => [item.base, this.quotes.get(item.base) ?? emptyExchangeQuoteStore()]),
+    );
     this.reconnectAll();
   }
 
@@ -163,6 +199,71 @@ export class MarketMonitorService {
       premiumPct,
       ready: Boolean(bestSpot && bestPerp),
     };
+  }
+
+  private syncGapRecords(): void {
+    const now = Date.now();
+    for (const item of this.selection) {
+      this.syncGapRecord(this.buildCoinSnapshot(item), now);
+    }
+  }
+
+  private syncGapRecord(coin: CoinSnapshot, now: number): void {
+    const active = this.activeGapRecords.get(coin.base);
+    const canPersist =
+      coin.bestSpot !== null &&
+      coin.bestPerp !== null &&
+      coin.premiumPct !== null &&
+      coin.premiumPct >= GAP_RECORD_THRESHOLD_PCT;
+
+    if (!canPersist || !coin.bestSpot || !coin.bestPerp || coin.premiumPct === null) {
+      if (active) {
+        this.recordStore.closeRecord(active.id, now, now - active.startedAt);
+        this.activeGapRecords.delete(coin.base);
+      }
+      return;
+    }
+
+    const routeKey = `${coin.bestSpot.exchange}:${coin.bestPerp.exchange}`;
+
+    if (active && active.routeKey === routeKey) {
+      this.recordStore.updateRecord(active.id, {
+        spotPrice: coin.bestSpot.mid,
+        perpPrice: coin.bestPerp.mid,
+        premiumPct: coin.premiumPct,
+        lastSeenAt: now,
+        durationMs: now - active.startedAt,
+      });
+      return;
+    }
+
+    if (active) {
+      this.recordStore.closeRecord(active.id, now, now - active.startedAt);
+      this.activeGapRecords.delete(coin.base);
+    }
+
+    const id = this.recordStore.createRecord({
+      base: coin.base,
+      spotExchange: coin.bestSpot.exchange,
+      spotPrice: coin.bestSpot.mid,
+      perpExchange: coin.bestPerp.exchange,
+      perpPrice: coin.bestPerp.mid,
+      premiumPct: coin.premiumPct,
+      startedAt: now,
+    });
+
+    this.activeGapRecords.set(coin.base, {
+      id,
+      routeKey,
+      startedAt: now,
+    });
+  }
+
+  private closeAllActiveGapRecords(now: number): void {
+    for (const [base, active] of this.activeGapRecords) {
+      this.recordStore.closeRecord(active.id, now, now - active.startedAt);
+      this.activeGapRecords.delete(base);
+    }
   }
 
   private collectActiveQuotes(
@@ -214,6 +315,11 @@ export class MarketMonitorService {
       mid: (bidValue + askValue) / 2,
       ts,
     };
+
+    const selection = this.selectionIndex.get(base);
+    if (selection) {
+      this.syncGapRecord(this.buildCoinSnapshot(selection), Date.now());
+    }
   }
 
   private connectBinance(kind: MarketKind): void {

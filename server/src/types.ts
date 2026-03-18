@@ -37,9 +37,24 @@ export interface CoinSnapshot {
   ready: boolean;
 }
 
+export interface GapRecord {
+  id: number;
+  base: string;
+  spotExchange: Exchange;
+  spotPrice: number;
+  perpExchange: Exchange;
+  perpPrice: number;
+  premiumPct: number;
+  startedAt: number;
+  lastSeenAt: number;
+  durationMs: number;
+  isActive: boolean;
+}
+
 export interface DashboardSnapshot {
   coins: CoinSnapshot[];
   leader: CoinSnapshot | null;
+  records: GapRecord[];
   updatedAt: number;
   staleAfterMs: number;
   streamHealth: Record<Exchange, Record<MarketKind, ConnectionStatus>>;

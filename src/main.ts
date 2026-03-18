@@ -2,6 +2,7 @@ import './style.css';
 
 type Exchange = 'binance' | 'okx' | 'bybit';
 type MarketKind = 'spot' | 'perp';
+type ActiveTab = 'realtime' | 'record';
 
 interface Quote {
   bid: number;
@@ -20,9 +21,24 @@ interface CoinSnapshot {
   ready: boolean;
 }
 
+interface GapRecord {
+  id: number;
+  base: string;
+  spotExchange: Exchange;
+  spotPrice: number;
+  perpExchange: Exchange;
+  perpPrice: number;
+  premiumPct: number;
+  startedAt: number;
+  lastSeenAt: number;
+  durationMs: number;
+  isActive: boolean;
+}
+
 interface DashboardSnapshot {
   coins: CoinSnapshot[];
   leader: CoinSnapshot | null;
+  records: GapRecord[];
   updatedAt: number;
   staleAfterMs: number;
   streamHealth: Record<Exchange, Record<MarketKind, 'connected' | 'disconnected'>>;
@@ -61,7 +77,7 @@ app.innerHTML = `
           <li>스테이블코인은 제외하고, 세 거래소 spot 24시간 USDT 거래대금을 합산해 상위 10개 코인을 선정합니다.</li>
           <li>가격은 각 시장의 최우선 매수호가와 매도호가의 중간값인 미드 가격으로 계산합니다.</li>
           <li>코인별로 세 거래소 중 가장 낮은 spot 미드와 가장 높은 perp 미드를 찾아 실시간 basis를 계산합니다.</li>
-          <li>프리미엄 공식은 (최고 perp - 최저 spot) / 최저 spot × 100 이며, 가장 높은 값을 상단에 강조합니다.</li>
+          <li>프리미엄 공식은 (최고 perp - 최저 spot) / 최저 spot x 100 이며, 0.5% 이상 발생한 gap은 DB에 duration과 함께 기록합니다.</li>
         </ul>
       </article>
     </section>
@@ -69,28 +85,57 @@ app.innerHTML = `
     <section class="card table-card">
       <div class="table-header">
         <div>
-          <p class="eyebrow small">Realtime Table</p>
+          <p class="eyebrow small">Monitor</p>
           <h2>거래소별 Spot / Perp 미드</h2>
         </div>
+        <div class="tab-strip">
+          <button type="button" class="tab-button is-active" data-tab="realtime">Realtime</button>
+          <button type="button" class="tab-button" data-tab="record">Record</button>
+        </div>
       </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>코인</th>
-              <th>Binance Spot</th>
-              <th>Binance Perp</th>
-              <th>OKX Spot</th>
-              <th>OKX Perp</th>
-              <th>Bybit Spot</th>
-              <th>Bybit Perp</th>
-              <th>최저 Spot</th>
-              <th>최고 Perp</th>
-              <th>프리미엄</th>
-            </tr>
-          </thead>
-          <tbody id="coin-table-body"></tbody>
-        </table>
+
+      <div id="realtime-panel" class="tab-panel">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>코인</th>
+                <th>Binance Spot</th>
+                <th>Binance Perp</th>
+                <th>OKX Spot</th>
+                <th>OKX Perp</th>
+                <th>Bybit Spot</th>
+                <th>Bybit Perp</th>
+                <th>최저 Spot</th>
+                <th>최고 Perp</th>
+                <th>프리미엄</th>
+              </tr>
+            </thead>
+            <tbody id="coin-table-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="record-panel" class="tab-panel is-hidden">
+        <div class="record-summary" id="record-summary"></div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>코인</th>
+                <th>Spot 거래소</th>
+                <th>Spot 가격</th>
+                <th>Perp 거래소</th>
+                <th>Perp 가격</th>
+                <th>갭</th>
+                <th>유지시간</th>
+                <th>발생시간</th>
+              </tr>
+            </thead>
+            <tbody id="record-table-body"></tbody>
+          </table>
+        </div>
       </div>
     </section>
   </main>
@@ -100,6 +145,14 @@ const updatedAtEl = document.querySelector<HTMLElement>('#updated-at')!;
 const leaderCardEl = document.querySelector<HTMLElement>('#leader-card')!;
 const streamHealthEl = document.querySelector<HTMLElement>('#stream-health')!;
 const coinTableBodyEl = document.querySelector<HTMLElement>('#coin-table-body')!;
+const recordTableBodyEl = document.querySelector<HTMLElement>('#record-table-body')!;
+const recordSummaryEl = document.querySelector<HTMLElement>('#record-summary')!;
+const realtimePanelEl = document.querySelector<HTMLElement>('#realtime-panel')!;
+const recordPanelEl = document.querySelector<HTMLElement>('#record-panel')!;
+const tabButtons = [...document.querySelectorAll<HTMLButtonElement>('.tab-button')];
+
+let activeTab: ActiveTab = 'realtime';
+let latestSnapshot: DashboardSnapshot | null = null;
 
 function formatMoney(value: number | null): string {
   if (value === null || !Number.isFinite(value)) {
@@ -134,6 +187,25 @@ function formatRelativeTime(timestamp: number): string {
   return `${seconds}초 전`;
 }
 
+function formatDuration(durationMs: number): string {
+  if (durationMs < 1000) {
+    return `${durationMs} ms`;
+  }
+
+  const totalSeconds = Math.max(0, Math.floor(durationMs / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  return [hours, minutes, seconds]
+    .map((value) => String(value).padStart(2, '0'))
+    .join(':');
+}
+
+function formatTimestamp(timestamp: number): string {
+  return new Date(timestamp).toLocaleString('ko-KR');
+}
+
 function renderLeader(leader: CoinSnapshot | null): void {
   if (!leader || leader.premiumPct === null || !leader.bestSpot || !leader.bestPerp) {
     leaderCardEl.innerHTML = `
@@ -161,7 +233,7 @@ function renderLeader(leader: CoinSnapshot | null): void {
 }
 
 function renderStreamHealth(snapshot: DashboardSnapshot): void {
-  const items = (Object.entries(snapshot.streamHealth) as Array<
+  streamHealthEl.innerHTML = (Object.entries(snapshot.streamHealth) as Array<
     [Exchange, Record<MarketKind, 'connected' | 'disconnected'>]
   >)
     .map(([exchange, health]) => {
@@ -183,8 +255,6 @@ function renderStreamHealth(snapshot: DashboardSnapshot): void {
       `;
     })
     .join('');
-
-  streamHealthEl.innerHTML = items;
 }
 
 function createPriceCell(quote: Quote | null, staleAfterMs: number): string {
@@ -199,7 +269,7 @@ function createPriceCell(quote: Quote | null, staleAfterMs: number): string {
   `;
 }
 
-function renderTable(snapshot: DashboardSnapshot): void {
+function renderRealtimeTable(snapshot: DashboardSnapshot): void {
   coinTableBodyEl.innerHTML = snapshot.coins
     .map((coin) => {
       const bestSpotLabel = coin.bestSpot
@@ -232,11 +302,72 @@ function renderTable(snapshot: DashboardSnapshot): void {
     .join('');
 }
 
+function renderRecordTable(snapshot: DashboardSnapshot): void {
+  const activeCount = snapshot.records.filter((record) => record.isActive).length;
+  recordSummaryEl.innerHTML = `
+    <div class="record-meta"><strong>${snapshot.records.length}</strong><span>저장된 record</span></div>
+    <div class="record-meta"><strong>${activeCount}</strong><span>현재 유지 중</span></div>
+    <div class="record-meta"><strong>0.500%</strong><span>저장 기준</span></div>
+  `;
+
+  if (snapshot.records.length === 0) {
+    recordTableBodyEl.innerHTML = `
+      <tr>
+        <td colspan="9">
+          <div class="empty-state">0.5% 이상 gap이 발생하면 record가 여기에 저장됩니다.</div>
+        </td>
+      </tr>
+    `;
+    return;
+  }
+
+  recordTableBodyEl.innerHTML = snapshot.records
+    .map(
+      (record) => `
+        <tr>
+          <td><span class="status-pill ${record.isActive ? 'active' : 'closed'}">${record.isActive ? 'ACTIVE' : 'CLOSED'}</span></td>
+          <td><strong>${record.base}</strong></td>
+          <td>${record.spotExchange.toUpperCase()}</td>
+          <td>${formatMoney(record.spotPrice)}</td>
+          <td>${record.perpExchange.toUpperCase()}</td>
+          <td>${formatMoney(record.perpPrice)}</td>
+          <td><span class="premium positive">${formatPercent(record.premiumPct)}</span></td>
+          <td>${formatDuration(record.durationMs)}</td>
+          <td>${formatTimestamp(record.startedAt)}</td>
+        </tr>
+      `,
+    )
+    .join('');
+}
+
 function render(snapshot: DashboardSnapshot): void {
-  updatedAtEl.textContent = new Date(snapshot.updatedAt).toLocaleString('ko-KR');
+  latestSnapshot = snapshot;
+  updatedAtEl.textContent = formatTimestamp(snapshot.updatedAt);
   renderLeader(snapshot.leader);
   renderStreamHealth(snapshot);
-  renderTable(snapshot);
+  renderRealtimeTable(snapshot);
+  renderRecordTable(snapshot);
+}
+
+function setActiveTab(tab: ActiveTab): void {
+  activeTab = tab;
+  realtimePanelEl.classList.toggle('is-hidden', tab !== 'realtime');
+  recordPanelEl.classList.toggle('is-hidden', tab !== 'record');
+
+  for (const button of tabButtons) {
+    button.classList.toggle('is-active', button.dataset.tab === tab);
+  }
+
+  if (latestSnapshot) {
+    render(latestSnapshot);
+  }
+}
+
+for (const button of tabButtons) {
+  button.addEventListener('click', () => {
+    const tab = button.dataset.tab as ActiveTab;
+    setActiveTab(tab);
+  });
 }
 
 async function loadInitialSnapshot(): Promise<void> {
@@ -271,5 +402,6 @@ loadInitialSnapshot()
     `;
   })
   .finally(() => {
+    setActiveTab(activeTab);
     subscribe();
   });

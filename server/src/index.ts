@@ -19,6 +19,10 @@ app.get('/api/snapshot', (_request, response) => {
   response.json(monitor.getSnapshot());
 });
 
+app.get('/api/records', (_request, response) => {
+  response.json(monitor.getSnapshot().records);
+});
+
 app.get('/api/stream', (request, response) => {
   response.writeHead(200, {
     'Cache-Control': 'no-cache',
